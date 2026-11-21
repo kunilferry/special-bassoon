@@ -1,0 +1,140 @@
+name: Tidecoin Kiosk - 5 Pixel 8 Emulators
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: tidecoin-kiosk-emulators
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run-kiosk:
+    name: Pixel 8 Emulator ${{ matrix.device }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        device: [1, 2, 3, 4, 5]
+
+    steps:
+      # 1. Clone repo kios
+      - name: Clone akunablurger/kios
+        uses: actions/checkout@v4
+        with:
+          repository: akunablurger/kios
+          ref: main
+          path: kios
+
+      - name: Check website HTTPS from runner
+        run: |
+          curl -L --silent --show-error \
+            --output /dev/null \
+            --write-out "HTTP %{http_code}; remote IP %{remote_ip}\n" \
+            --max-time 30 \
+            https://tidecoinweb.vercel.app
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Generate Gradle Wrapper if missing
+        working-directory: kios
+        run: |
+          if [ ! -f ./gradlew ]; then
+            gradle wrapper --gradle-version 8.9
+          fi
+          chmod +x ./gradlew
+
+      - name: Build Debug APK
+        working-directory: kios
+        run: ./gradlew --no-daemon assembleDebug --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: tidecoin-kiosk-apk-${{ matrix.device }}
+          path: kios/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Enable KVM
+        run: |
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm
+            ls -l /dev/kvm
+          else
+            echo "KVM unavailable; emulator may use software acceleration."
+          fi
+
+      - name: Run app on Pixel 8 emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_8
+          cores: 4
+          force-avd-creation: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -memory 4096 -netdelay none -netspeed full
+          working-directory: kios
+          script: |
+            set -eu
+            mkdir -p diagnostics
+
+            adb logcat -c
+            adb shell svc wifi enable
+            sleep 10
+
+            adb install -r app/build/outputs/apk/debug/app-debug.apk
+            adb shell am start -W -n com.tidecoin.kiosk/.MainActivity
+
+            echo "Waiting for the Android pinning dialog"
+            sleep 5
+            adb shell input tap 1865 875
+
+            echo "Waiting 45 seconds for the website to load"
+            sleep 45
+
+            adb shell pidof com.tidecoin.kiosk > diagnostics/process-start.txt
+            adb shell screencap -p /sdcard/kiosk-start.png
+            adb pull /sdcard/kiosk-start.png diagnostics/kiosk-start.png
+            adb logcat -d -v time > diagnostics/logcat-start.txt
+            grep -iE 'KiosWebView|chromium|WebView|tidecoinweb|net::|SSL|ERR_' diagnostics/logcat-start.txt > diagnostics/webview-start.txt || true
+
+            echo "Keeping the app open for about 5 hours and 45 minutes"
+            sleep 20700
+
+            adb shell pidof com.tidecoin.kiosk > diagnostics/process-end.txt
+            adb shell screencap -p /sdcard/kiosk-end.png
+            adb pull /sdcard/kiosk-end.png diagnostics/kiosk-end.png
+            adb logcat -d -v time > diagnostics/logcat-end.txt
+            grep -iE 'KiosWebView|chromium|WebView|tidecoinweb|net::|SSL|ERR_' diagnostics/logcat-end.txt > diagnostics/webview-end.txt || true
+
+            test -s diagnostics/process-end.txt
+
+      - name: Upload screenshots and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tidecoin-kiosk-diagnostics-${{ matrix.device }}
+          path: kios/diagnostics/
+          if-no-files-found: warn
+          retention-days: 7
